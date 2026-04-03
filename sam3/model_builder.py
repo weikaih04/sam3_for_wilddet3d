@@ -63,6 +63,25 @@ def _setup_tf32() -> None:
 _setup_tf32()
 
 
+_ACT_CKPT_PRINTED = False
+
+def _get_use_act_checkpoint() -> bool:
+    """Get activation checkpointing setting from environment variable.
+
+    Set SAM3_DISABLE_ACT_CKPT=1 to disable activation checkpointing.
+    This will use more GPU memory but speed up backward pass.
+    """
+    global _ACT_CKPT_PRINTED
+    disable = os.environ.get("SAM3_DISABLE_ACT_CKPT", "0") == "1"
+    if not _ACT_CKPT_PRINTED:
+        if disable:
+            print("[SAM3] Activation checkpointing DISABLED (SAM3_DISABLE_ACT_CKPT=1)")
+        else:
+            print("[SAM3] Activation checkpointing ENABLED (default)")
+        _ACT_CKPT_PRINTED = True
+    return not disable
+
+
 def _create_position_encoding(precompute_resolution=None):
     """Create position encoding for visual backbone."""
     return PositionEmbeddingSine(
@@ -103,11 +122,17 @@ def _create_vit_backbone(compile_mode=None, use_fa3=False, use_rope_real=False):
         compile_mode=compile_mode,
         use_fa3=use_fa3,
         use_rope_real=use_rope_real,
+        use_act_checkpoint=_get_use_act_checkpoint(),
     )
 
 
 def _create_vit_neck(position_encoding, vit_backbone, enable_inst_interactivity=False):
-    """Create ViT neck for feature pyramid."""
+    """Create ViT neck for feature pyramid.
+
+    Keep 4 scales to match encoder/decoder expectations (3 levels after scalp=1).
+    SAM3.1 ckpt only has convs.0-2 weights; convs.3 uses random init but is
+    discarded by scalp=1, so this is safe for both SAM3 and SAM3.1 checkpoints.
+    """
     return Sam3DualViTDetNeck(
         position_encoding=position_encoding,
         d_model=256,
@@ -122,7 +147,7 @@ def _create_vl_backbone(vit_neck, text_encoder):
     return SAM3VLBackbone(visual=vit_neck, text=text_encoder, scalp=1)
 
 
-def _create_transformer_encoder(use_fa3=False) -> TransformerEncoderFusion:
+def _create_transformer_encoder(compile_mode=None, use_fa3=False) -> TransformerEncoderFusion:
     """Create transformer encoder with its layer."""
     encoder_layer = TransformerEncoderLayer(
         activation="relu",
@@ -155,14 +180,15 @@ def _create_transformer_encoder(use_fa3=False) -> TransformerEncoderFusion:
         d_model=256,
         num_feature_levels=1,
         frozen=False,
-        use_act_checkpoint=True,
+        use_act_checkpoint=_get_use_act_checkpoint(),
         add_pooled_text_to_img_feat=False,
         pool_text_with_mask=True,
+        compile_mode=compile_mode,
     )
     return encoder
 
 
-def _create_transformer_decoder(use_fa3=False) -> TransformerDecoder:
+def _create_transformer_decoder(compile_mode=None, use_fa3=False) -> TransformerDecoder:
     """Create transformer decoder with its layer."""
     decoder_layer = TransformerDecoderLayer(
         activation="relu",
@@ -194,8 +220,9 @@ def _create_transformer_decoder(use_fa3=False) -> TransformerDecoder:
         dac_use_selfatt_ln=True,
         resolution=1008,
         stride=14,
-        use_act_checkpoint=True,
+        use_act_checkpoint=_get_use_act_checkpoint(),
         presence_token=True,
+        compile_mode=compile_mode,
     )
     return decoder
 
@@ -292,7 +319,7 @@ def _create_geometry_encoder():
         d_model=256,
         num_layers=3,
         layer=geo_layer,
-        use_act_ckpt=True,
+        use_act_ckpt=_get_use_act_checkpoint(),
         add_cls=True,
         add_post_encode_proj=True,
     )
@@ -498,7 +525,13 @@ def build_tracker(
 
 
 def _create_text_encoder(bpe_path: str) -> VETextEncoder:
-    """Create SAM3 text encoder."""
+    """Create SAM3 text encoder.
+
+    Text encoder act_ckpt hardcoded False: negative sampling changes
+    the text batch size per step, causing checkpoint recompute shape
+    mismatch. Text encoder memory is small so disabling has minimal impact.
+    All other modules (ViT, encoder, decoder, geometry) keep act_ckpt=True.
+    """
     tokenizer = SimpleTokenizer(bpe_path=bpe_path)
     return VETextEncoder(
         tokenizer=tokenizer,
@@ -506,6 +539,7 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
         width=1024,
         heads=16,
         layers=24,
+        use_act_checkpoint=False,
     )
 
 
@@ -527,11 +561,11 @@ def _create_vision_backbone(
 
 
 def _create_sam3_transformer(
-    has_presence_token: bool = True, use_fa3: bool = False
+    has_presence_token: bool = True, compile_mode=None, use_fa3: bool = False
 ) -> TransformerWrapper:
     """Create SAM3 transformer encoder and decoder."""
-    encoder: TransformerEncoderFusion = _create_transformer_encoder(use_fa3=use_fa3)
-    decoder: TransformerDecoder = _create_transformer_decoder(use_fa3=use_fa3)
+    encoder: TransformerEncoderFusion = _create_transformer_encoder(compile_mode=compile_mode, use_fa3=use_fa3)
+    decoder: TransformerDecoder = _create_transformer_decoder(compile_mode=compile_mode, use_fa3=use_fa3)
 
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
@@ -542,9 +576,14 @@ def _load_checkpoint(model, checkpoint_path):
         ckpt = torch.load(f, map_location="cpu", weights_only=True)
     if "model" in ckpt and isinstance(ckpt["model"], dict):
         ckpt = ckpt["model"]
-    sam3_image_ckpt = {
-        k.replace("detector.", ""): v for k, v in ckpt.items() if "detector" in k
-    }
+    sam3_image_ckpt = {}
+    for k, v in ckpt.items():
+        if "detector" not in k:
+            continue
+        new_k = k.replace("detector.", "")
+        # SAM3.1 renames sam2_convs -> interactive_convs; map back for DualViTDetNeck
+        new_k = new_k.replace("interactive_convs", "sam2_convs")
+        sam3_image_ckpt[new_k] = v
     if model.inst_interactive_predictor is not None:
         sam3_image_ckpt.update(
             {
@@ -613,14 +652,17 @@ def build_sam3_image_model(
     backbone = _create_vl_backbone(vision_encoder, text_encoder)
 
     # Create transformer components
-    transformer = _create_sam3_transformer()
+    # NOTE: Do NOT compile encoder/decoder - they have dynamic shapes that cause errors
+    # Only ViT backbone is compiled (via vision_encoder above)
+    transformer = _create_sam3_transformer(compile_mode=None)
 
     # Create dot product scoring
     dot_prod_scoring = _create_dot_product_scoring()
 
     # Create segmentation head if enabled
+    # NOTE: Do NOT compile segmentation head - may have dynamic shapes
     segmentation_head = (
-        _create_segmentation_head(compile_mode=compile_mode)
+        _create_segmentation_head(compile_mode=None)
         if enable_segmentation
         else None
     )

@@ -312,6 +312,9 @@ class Sam3Image(torch.nn.Module):
         num_o2m = hs.size(2) - num_o2o
         assert num_o2m == (num_o2o if apply_dac else 0)
         out["queries"] = hs[-1][:, :num_o2o]  # remove o2m queries if there are any
+        # Add O2M queries for 3D head (SAM3_3D extension)
+        if num_o2m > 0 and self.training:
+            out["queries_o2m"] = hs[-1][:, num_o2o:]
         # score prediction
         if self.use_dot_prod_scoring:
             dot_prod_scoring_head = self.dot_prod_scoring

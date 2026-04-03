@@ -438,8 +438,9 @@ class TransformerEncoder(nn.Module):
             layer_kwargs["tgt"] = output
             layer_kwargs["tgt_key_padding_mask"] = key_padding_masks_flatten
 
-            if self.training:
-                assert self.use_act_checkpoint, "activation ckpt not enabled in encoder"
+            # Allow disabling activation checkpointing for profiling
+            # if self.training:
+            #     assert self.use_act_checkpoint, "activation ckpt not enabled in encoder"
             if encoder_extra_kwargs is not None:
                 layer_kwargs.update(encoder_extra_kwargs)
             output = activation_ckpt_wrapper(layer)(

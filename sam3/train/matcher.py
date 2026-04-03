@@ -612,6 +612,10 @@ class BinaryHungarianMatcherV2(nn.Module):
             C = torch.where(out_is_valid[:, :, None], C, 1e9)
         if target_is_valid_padded is not None:
             C = torch.where(target_is_valid_padded[:, None, :], C, 1e9)
+        # Guard against NaN/Inf from numerical edge cases (e.g. zero-area
+        # boxes in GIoU, log(0) in focal cost). Assign high cost so these
+        # entries are never matched by the Hungarian algorithm.
+        C = torch.nan_to_num(C, nan=1e9, posinf=1e9, neginf=-1e9)
         C = C.cpu().numpy()
         costs = [C[i, :, :s] for i, s in enumerate(num_boxes.tolist())]
         return_tgt_indices = (

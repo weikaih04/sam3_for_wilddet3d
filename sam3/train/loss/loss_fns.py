@@ -391,9 +391,16 @@ class IABCEMdetr(LossWithWeights):
         ):
             loss_bce = loss_bce * self.pad_scale_pos
         # Negatives
-        loss_bce = loss_bce + F.binary_cross_entropy_with_logits(
+        loss_neg = F.binary_cross_entropy_with_logits(
             src_logits, target_classes, reduction="none"
         ) * (1 - target_classes) * (prob**self.gamma)
+
+        # Suppress negative loss for predictions overlapping ignore boxes
+        if "ignore_neg_mask" in targets:
+            neg_suppress = targets["ignore_neg_mask"]  # (B, S)
+            loss_neg = loss_neg * (1 - neg_suppress)
+
+        loss_bce = loss_bce + loss_neg
 
         # Optionally, not applying IABCEMdetr loss to detection queries in video.
         is_video_grounding = outputs.get("is_video_grounding_batch", False)
@@ -432,6 +439,7 @@ class IABCEMdetr(LossWithWeights):
                     num_boxes=bs,
                     alpha=self.presence_alpha,
                     gamma=self.presence_gamma,
+                    triton=False,  # triton kernel unstable with gamma=0 + bf16
                 )
                 pred = (presence_logits.sigmoid() > 0.5).float()
                 presence_dec_acc = (pred == keep_loss).float().mean()

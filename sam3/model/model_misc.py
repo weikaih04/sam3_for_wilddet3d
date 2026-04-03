@@ -29,12 +29,14 @@ except ImportError:
 def inverse_sigmoid(x, eps=1e-3):
     """
     The inverse function for sigmoid activation function.
-    Note: It might face numberical issues with fp16 small eps.
+    Compute in fp32 to avoid numerical issues with bf16/fp16.
     """
+    input_dtype = x.dtype
+    x = x.float()
     x = x.clamp(min=0, max=1)
     x1 = x.clamp(min=eps)
     x2 = (1 - x).clamp(min=eps)
-    return torch.log(x1 / x2)
+    return torch.log(x1 / x2).to(input_dtype)
 
 
 def get_sdpa_settings():

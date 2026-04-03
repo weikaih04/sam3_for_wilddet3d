@@ -68,10 +68,15 @@ class Mlp(nn.Module):
         self.drop2 = nn.Dropout(drop_probs[1])
 
     def forward(self, x):
-        x = addmm_act(type(self.act), self.fc1, x)
+        if torch.is_grad_enabled():
+            # Training: standard path (addmm_act requires grad disabled)
+            x = self.fc1(x)
+            x = self.act(x)
+        else:
+            x = addmm_act(type(self.act), self.fc1, x)
         x = self.drop1(x)
         x = self.norm(x)
-        x = self.fc2(x)
+        x = self.fc2(x.to(self.fc2.weight.dtype))
         x = self.drop2(x)
         return x
 
@@ -932,10 +937,20 @@ class ViT(nn.Module):
         self.apply(self._init_weights)
 
         if compile_mode is not None:
-            self.forward = torch.compile(
+            # Only compile for training mode, skip compile for eval to avoid
+            # long compilation time during validation
+            self._forward_uncompiled = self.forward
+            self._forward_compiled = torch.compile(
                 self.forward, mode=compile_mode, fullgraph=True
             )
-            if self.use_act_checkpoint and self.training:
+            # Override forward to dispatch based on training mode
+            def _dispatch_forward(x):
+                if self.training:
+                    return self._forward_compiled(x)
+                else:
+                    return self._forward_uncompiled(x)
+            self.forward = _dispatch_forward
+            if self.use_act_checkpoint:
                 torch._dynamo.config.optimize_ddp = False
 
     def _init_weights(self, m: nn.Module) -> None:
